@@ -572,7 +572,7 @@ async fn test_inactive_validator_pool_read() {
         assert_eq!(
             system_state
                 .get_current_epoch_committee()
-                .committee
+                .committee()
                 .num_members(),
             4
         );
@@ -708,6 +708,70 @@ async fn do_test_reconfig_with_committee_change_stress() {
             .iter()
             .all(|v| !committee.authority_exists(v));
     }
+}
+
+#[cfg(msim)]
+#[sim_test]
+async fn test_epoch_flag_upgrade() {
+    use std::sync::Mutex;
+    use sui_core::authority::epoch_start_configuration::EpochFlag;
+    use sui_core::authority::epoch_start_configuration::EpochStartConfigTrait;
+    use sui_macros::register_fail_point_arg;
+
+    let initial_flags_nodes = Arc::new(Mutex::new(HashSet::new()));
+    register_fail_point_arg("initial_epoch_flags", move || {
+        // only alter flags on each node once
+        let current_node = sui_simulator::current_simnode_id();
+
+        // override flags on up to 2 nodes.
+        let mut initial_flags_nodes = initial_flags_nodes.lock().unwrap();
+        if initial_flags_nodes.len() >= 2 || !initial_flags_nodes.insert(current_node) {
+            return None;
+        }
+
+        // start with no flags set
+        Some(Vec::<EpochFlag>::new())
+    });
+
+    let test_cluster = TestClusterBuilder::new()
+        .with_epoch_duration_ms(30000)
+        .build()
+        .await;
+
+    let mut any_empty = false;
+    for node in test_cluster.all_node_handles() {
+        any_empty = any_empty
+            || node.with(|node| {
+                node.state()
+                    .epoch_store_for_testing()
+                    .epoch_start_config()
+                    .flags()
+                    .is_empty()
+            });
+    }
+    assert!(any_empty);
+
+    test_cluster.wait_for_epoch_all_nodes(1).await;
+
+    let mut any_empty = false;
+    for node in test_cluster.all_node_handles() {
+        any_empty = any_empty
+            || node.with(|node| {
+                node.state()
+                    .epoch_store_for_testing()
+                    .epoch_start_config()
+                    .flags()
+                    .is_empty()
+            });
+    }
+    assert!(!any_empty);
+
+    sleep(Duration::from_secs(15)).await;
+
+    test_cluster.stop_all_validators().await;
+    test_cluster.start_all_validators().await;
+
+    test_cluster.wait_for_epoch_all_nodes(2).await;
 }
 
 #[cfg(msim)]

@@ -19,7 +19,7 @@ use sui_config::node::{AuthorityOverloadConfig, DBCheckpointConfig, RunWithRange
 use sui_config::NodeConfig;
 use sui_macros::nondeterministic;
 use sui_node::SuiNodeHandle;
-use sui_protocol_config::{ProtocolVersion, SupportedProtocolVersions};
+use sui_protocol_config::ProtocolVersion;
 use sui_swarm_config::genesis_config::{AccountConfig, GenesisConfig, ValidatorGenesisConfig};
 use sui_swarm_config::network_config::NetworkConfig;
 use sui_swarm_config::network_config_builder::{
@@ -29,6 +29,7 @@ use sui_swarm_config::network_config_builder::{
 use sui_swarm_config::node_config_builder::FullnodeConfigBuilder;
 use sui_types::base_types::AuthorityName;
 use sui_types::object::Object;
+use sui_types::supported_protocol_versions::SupportedProtocolVersions;
 use tempfile::TempDir;
 use tracing::info;
 
@@ -306,6 +307,8 @@ impl<R: rand::RngCore + rand::CryptoRng> SwarmBuilder<R> {
             SwarmDirectory::new_temporary()
         };
 
+        let ingest_data = self.data_ingestion_dir.clone();
+
         let network_config = self.network_config.unwrap_or_else(|| {
             let mut config_builder = ConfigBuilder::new(dir.as_ref());
 
@@ -371,7 +374,9 @@ impl<R: rand::RngCore + rand::CryptoRng> SwarmBuilder<R> {
             .with_db_checkpoint_config(self.db_checkpoint_config.clone())
             .with_run_with_range(self.fullnode_run_with_range)
             .with_policy_config(self.fullnode_policy_config)
+            .with_data_ingestion_dir(ingest_data)
             .with_fw_config(self.fullnode_fw_config);
+
         if let Some(spvc) = &self.fullnode_supported_protocol_versions_config {
             let supported_versions = match spvc {
                 ProtocolVersionsConfig::Default => SupportedProtocolVersions::SYSTEM_DEFAULT,

@@ -3,6 +3,7 @@
 
 use itertools::Itertools;
 use mysten_metrics::monitored_scope;
+use prometheus::{register_int_gauge_with_registry, IntGauge, Registry};
 use serde::Serialize;
 use sui_protocol_config::ProtocolConfig;
 use sui_types::base_types::{ObjectID, ObjectRef, SequenceNumber, VersionNumber};
@@ -25,6 +26,24 @@ use sui_types::messages_checkpoint::{CheckpointSequenceNumber, ECMHLiveObjectSet
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store_tables::LiveObject;
 
+pub struct StateAccumulatorMetrics {
+    inconsistent_state: IntGauge,
+}
+
+impl StateAccumulatorMetrics {
+    pub fn new(registry: &Registry) -> Arc<Self> {
+        let this = Self {
+            inconsistent_state: register_int_gauge_with_registry!(
+                "accumulator_inconsistent_state",
+                "1 if accumulated live object set differs from StateAccumulator root state hash for the previous epoch",
+                registry
+            )
+            .unwrap(),
+        };
+        Arc::new(this)
+    }
+}
+
 pub enum StateAccumulator {
     V1(StateAccumulatorV1),
     V2(StateAccumulatorV2),
@@ -32,10 +51,12 @@ pub enum StateAccumulator {
 
 pub struct StateAccumulatorV1 {
     store: Arc<dyn AccumulatorStore>,
+    metrics: Arc<StateAccumulatorMetrics>,
 }
 
 pub struct StateAccumulatorV2 {
     store: Arc<dyn AccumulatorStore>,
+    metrics: Arc<StateAccumulatorMetrics>,
 }
 
 pub trait AccumulatorStore: ObjectStore + Send + Sync {
@@ -366,16 +387,40 @@ impl StateAccumulator {
     pub fn new(
         store: Arc<dyn AccumulatorStore>,
         epoch_store: &Arc<AuthorityPerEpochStore>,
+        metrics: Arc<StateAccumulatorMetrics>,
     ) -> Self {
-        if cfg!(msim) {
-            if epoch_store.state_accumulator_v2_enabled() {
-                return StateAccumulator::V2(StateAccumulatorV2::new(store));
-            } else {
-                return StateAccumulator::V1(StateAccumulatorV1::new(store));
-            }
+        if epoch_store.state_accumulator_v2_enabled() {
+            StateAccumulator::V2(StateAccumulatorV2::new(store, metrics))
+        } else {
+            StateAccumulator::V1(StateAccumulatorV1::new(store, metrics))
         }
+    }
 
-        StateAccumulator::V1(StateAccumulatorV1::new(store))
+    pub fn new_for_tests(
+        store: Arc<dyn AccumulatorStore>,
+        epoch_store: &Arc<AuthorityPerEpochStore>,
+    ) -> Self {
+        Self::new(
+            store,
+            epoch_store,
+            StateAccumulatorMetrics::new(&Registry::new()),
+        )
+    }
+
+    pub fn metrics(&self) -> Arc<StateAccumulatorMetrics> {
+        match self {
+            StateAccumulator::V1(impl_v1) => impl_v1.metrics.clone(),
+            StateAccumulator::V2(impl_v2) => impl_v2.metrics.clone(),
+        }
+    }
+
+    pub fn set_inconsistent_state(&self, is_inconsistent_state: bool) {
+        match self {
+            StateAccumulator::V1(impl_v1) => &impl_v1.metrics,
+            StateAccumulator::V2(impl_v2) => &impl_v2.metrics,
+        }
+        .inconsistent_state
+        .set(is_inconsistent_state as i64);
     }
 
     /// Accumulates the effects of a single checkpoint and persists the accumulator.
@@ -528,8 +573,8 @@ impl StateAccumulator {
 }
 
 impl StateAccumulatorV1 {
-    pub fn new(store: Arc<dyn AccumulatorStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<dyn AccumulatorStore>, metrics: Arc<StateAccumulatorMetrics>) -> Self {
+        Self { store, metrics }
     }
 
     /// Unions all checkpoint accumulators at the end of the epoch to generate the
@@ -618,8 +663,8 @@ impl StateAccumulatorV1 {
 }
 
 impl StateAccumulatorV2 {
-    pub fn new(store: Arc<dyn AccumulatorStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<dyn AccumulatorStore>, metrics: Arc<StateAccumulatorMetrics>) -> Self {
+        Self { store, metrics }
     }
 
     pub async fn accumulate_running_root(
@@ -629,6 +674,10 @@ impl StateAccumulatorV2 {
         checkpoint_acc: Option<Accumulator>,
     ) -> SuiResult {
         let _scope = monitored_scope("AccumulateRunningRoot");
+        tracing::info!(
+            "accumulating running root for checkpoint {}",
+            checkpoint_seq_num
+        );
 
         // For the last checkpoint of the epoch, this function will be called once by the
         // checkpoint builder, and again by checkpoint executor.
@@ -659,21 +708,32 @@ impl StateAccumulatorV2 {
             // bootstrap from the previous epoch's root state hash. Because this
             // should only occur at beginning of epoch, we shouldn't have to worry
             // about race conditions on reading the highest running root accumulator.
-            let (prev_epoch, (last_checkpoint_prev_epoch, prev_acc)) = self
-                .store
-                .get_root_state_accumulator_for_highest_epoch()?
-                .expect("Expected root state hash for previous epoch to exist");
-            if last_checkpoint_prev_epoch != checkpoint_seq_num - 1 {
+            if let Some((prev_epoch, (last_checkpoint_prev_epoch, prev_acc))) =
+                self.store.get_root_state_accumulator_for_highest_epoch()?
+            {
+                if last_checkpoint_prev_epoch != checkpoint_seq_num - 1 {
+                    epoch_store
+                        .notify_read_running_root(checkpoint_seq_num - 1)
+                        .await?
+                } else {
+                    assert_eq!(
+                        prev_epoch + 1,
+                        epoch_store.epoch(),
+                        "Expected highest existing root state hash to be for previous epoch",
+                    );
+                    prev_acc
+                }
+            } else {
+                // Rare edge case where we manage to somehow lag in checkpoint execution from genesis
+                // such that the end of epoch checkpoint is built before we execute any checkpoints.
+                assert_eq!(
+                    epoch_store.epoch(),
+                    0,
+                    "Expected epoch to be 0 if previous root state hash does not exist"
+                );
                 epoch_store
                     .notify_read_running_root(checkpoint_seq_num - 1)
                     .await?
-            } else {
-                assert_eq!(
-                    prev_epoch + 1,
-                    epoch_store.epoch(),
-                    "Expected highest existing root state hash to be for previous epoch",
-                );
-                prev_acc
             }
         } else {
             epoch_store

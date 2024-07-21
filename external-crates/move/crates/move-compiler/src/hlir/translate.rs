@@ -529,6 +529,7 @@ fn struct_def(
     let N::StructDefinition {
         warning_filter,
         index,
+        loc: _loc,
         attributes,
         abilities,
         type_parameters,
@@ -572,6 +573,7 @@ fn enum_def(
     let N::EnumDefinition {
         warning_filter,
         index,
+        loc: _loc,
         attributes,
         abilities,
         type_parameters,
@@ -1606,7 +1608,7 @@ fn value(
             error_exp(eloc)
         }
         E::UnresolvedError => {
-            assert!(context.env.has_errors());
+            assert!(context.env.has_errors() || context.env.ide_mode());
             make_exp(HE::UnresolvedError)
         }
     };

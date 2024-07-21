@@ -22,11 +22,53 @@ const TRAFFIC_SINK_TIMEOUT_SEC: u64 = 300;
 /// protocol, such as a load balancer. Note that this is not the
 /// same as the client type (e.g a direct client vs a proxy client,
 /// as in the case of a fullnode driving requests from many clients).
+///
+/// For x-forwarded-for, the usize parameter is the number of forwarding
+/// hops between the client and the node for requests going your infra
+/// or infra provider. Example:
+///
+/// ```ignore
+///     (client) -> { (global proxy) -> (regional proxy) -> (node) }
+/// ```
+///
+/// where
+///
+/// ```ignore
+///     { <server>, ... }
+/// ```
+///
+/// are controlled by the Node operator / their cloud provider.
+/// In this case, we set:
+///
+/// ```ignore
+/// policy-config:
+///    client-id-source:
+///      x-forwarded-for: 2
+///    ...
+/// ```
+///
+/// NOTE: x-forwarded-for: 0 is a special case value that can be used by Node
+/// operators to discover the number of hops that should be configured. To use:
+///
+/// 1. Set `x-forwarded-for: 0` for the `client-id-source` in the config.
+/// 2. Run the node and query any endpoint (AuthorityServer for validator, or json rpc for rpc node)
+///     from a known IP address.
+/// 3. Search for lines containing `x-forwarded-for` in the logs. The log lines should contain
+///    the contents of the `x-forwarded-for` header, if present, or a corresponding error if not.
+/// 4. The value for number of hops is derived from any such log line that contains your known IP
+///     address, and is defined as 1 + the number of IP addresses in the `x-forwarded-for` that occur
+///     **after** the known client IP address. Example:
+///
+/// ```ignore
+///     [<known client IP>] <--- number of hops is 1
+///     ["1.2.3.4", <known client IP>, "5.6.7.8", "9.10.11.12"] <--- number of hops is 3
+/// ```
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum ClientIdSource {
     #[default]
     SocketAddr,
-    XForwardedFor,
+    XForwardedFor(usize),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -53,7 +95,7 @@ impl Weight {
         self.0
     }
 
-    pub async fn is_sampled(&self) -> bool {
+    pub fn is_sampled(&self) -> bool {
         let mut rng = rand::thread_rng();
         let sample = rand::distributions::Uniform::new(0.0, 1.0).sample(&mut rng);
         sample <= self.value()
@@ -201,6 +243,11 @@ pub struct PolicyConfig {
     #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
     #[serde(default = "default_spam_sample_rate")]
+    /// Note that this sample policy is applied on top of the
+    /// endpoint-specific sample policy (not configurable) which
+    /// weighs endpoints by the relative effort required to serve
+    /// them. Therefore a sample rate of N will yield an actual
+    /// sample rate <= N.
     pub spam_sample_rate: Weight,
     #[serde(default = "default_dry_run")]
     pub dry_run: bool,

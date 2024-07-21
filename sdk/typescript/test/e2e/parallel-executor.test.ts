@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+import { afterEach } from 'node:test';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, Mock, vi } from 'vitest';
 
 import { bcs } from '../../src/bcs';
@@ -11,8 +12,13 @@ import { setup, TestToolbox } from './utils/setup';
 
 let toolbox: TestToolbox;
 let executor: ParallelTransactionExecutor;
+
 beforeAll(async () => {
 	toolbox = await setup();
+
+	// Creates bear package
+	await toolbox.mintNft();
+
 	executor = new ParallelTransactionExecutor({
 		client: toolbox.client,
 		signer: toolbox.keypair,
@@ -23,6 +29,10 @@ beforeAll(async () => {
 	vi.spyOn(toolbox.client, 'multiGetObjects');
 	vi.spyOn(toolbox.client, 'getCoins');
 	vi.spyOn(toolbox.client, 'executeTransactionBlock');
+});
+
+afterEach(async () => {
+	await executor.waitForLastTransaction();
 });
 
 afterAll(() => {
@@ -54,11 +64,13 @@ describe('ParallelTransactionExecutor', () => {
 			});
 		});
 
-		const txbs = Array.from({ length: 10 }, () => {
+		const txbs = [];
+
+		for (let i = 0; i < 10; i++) {
 			const txb = new Transaction();
-			txb.transferObjects([txb.splitCoins(txb.gas, [1])[0]], toolbox.address());
-			return txb;
-		});
+			txb.transferObjects([await toolbox.mintNft()], toolbox.address());
+			txbs.push(txb);
+		}
 
 		const results = await Promise.all(txbs.map((txb) => executor.executeTransaction(txb)));
 

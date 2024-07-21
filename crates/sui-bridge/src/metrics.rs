@@ -19,6 +19,10 @@ pub struct BridgeMetrics {
     pub(crate) err_requests: IntCounterVec,
     pub(crate) requests_inflight: IntGaugeVec,
 
+    pub last_synced_sui_checkpoint: IntGauge,
+    pub(crate) last_finalized_eth_block: IntGauge,
+    pub(crate) last_synced_eth_block: IntGauge,
+
     pub(crate) sui_watcher_received_events: IntCounter,
     pub(crate) sui_watcher_received_actions: IntCounter,
     pub(crate) sui_watcher_unrecognized_events: IntCounter,
@@ -30,8 +34,10 @@ pub struct BridgeMetrics {
     pub(crate) action_executor_signing_queue_skipped_actions: IntCounter,
     pub(crate) action_executor_execution_queue_received_actions: IntCounter,
 
-    pub(crate) eth_provider_queries: IntCounter,
+    pub(crate) signer_with_cache_hit: IntCounterVec,
+    pub(crate) signer_with_cache_miss: IntCounterVec,
 
+    pub(crate) eth_provider_queries: IntCounter,
     pub(crate) gas_coin_balance: IntGauge,
 }
 
@@ -165,6 +171,38 @@ impl BridgeMetrics {
             eth_provider_queries: register_int_counter_with_registry!(
                 "bridge_eth_provider_queries",
                 "Total number of queries issued to eth provider",
+                registry,
+            )
+            .unwrap(),
+            last_synced_sui_checkpoint: register_int_gauge_with_registry!(
+                "last_synced_sui_checkpoint",
+                "The latest sui checkpoint that indexer synced",
+                registry,
+            )
+            .unwrap(),
+            last_synced_eth_block: register_int_gauge_with_registry!(
+                "bridge_last_synced_eth_block",
+                "The latest finalized eth block that indexer synced",
+                registry,
+            )
+            .unwrap(),
+            last_finalized_eth_block: register_int_gauge_with_registry!(
+                "bridge_last_finalized_eth_block",
+                "The latest finalized eth block that indexer observed",
+                registry,
+            )
+            .unwrap(),
+            signer_with_cache_hit: register_int_counter_vec_with_registry!(
+                "bridge_signer_with_cache_hit",
+                "Total number of hit in signer's cache, by verifier type",
+                &["type"],
+                registry,
+            )
+            .unwrap(),
+            signer_with_cache_miss: register_int_counter_vec_with_registry!(
+                "bridge_signer_with_cache_miss",
+                "Total number of miss in signer's cache, by verifier type",
+                &["type"],
                 registry,
             )
             .unwrap(),

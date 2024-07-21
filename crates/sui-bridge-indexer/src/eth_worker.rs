@@ -1,13 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::Config;
+use crate::config::IndexerConfig;
 use crate::latest_eth_syncer::LatestEthSyncer;
 use crate::metrics::BridgeIndexerMetrics;
 use crate::postgres_manager::get_latest_eth_token_transfer;
 use crate::postgres_manager::{write, PgPool};
-use crate::{BridgeDataSource, TokenTransfer, TokenTransferData, TokenTransferStatus};
-use anyhow::Result;
+use crate::{
+    BridgeDataSource, ProcessedTxnData, TokenTransfer, TokenTransferData, TokenTransferStatus,
+};
+use anyhow::{anyhow, Result};
 use ethers::providers::Provider;
 use ethers::providers::{Http, Middleware};
 use ethers::types::Address as EthAddress;
@@ -16,27 +18,30 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use sui_bridge::abi::{EthBridgeEvent, EthSuiBridgeEvents};
-use sui_bridge::types::EthLog;
+use sui_bridge::metrics::BridgeMetrics;
+use sui_bridge::types::EthEvent;
 use sui_bridge::{eth_client::EthClient, eth_syncer::EthSyncer};
 use tokio::task::JoinHandle;
 use tracing::info;
 use tracing::log::error;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EthBridgeWorker {
     provider: Arc<Provider<Http>>,
     pg_pool: PgPool,
+    bridge_metrics: Arc<BridgeMetrics>,
     metrics: BridgeIndexerMetrics,
     bridge_address: EthAddress,
-    config: Config,
+    config: IndexerConfig,
 }
 
 impl EthBridgeWorker {
     pub fn new(
         pg_pool: PgPool,
+        bridge_metrics: Arc<BridgeMetrics>,
         metrics: BridgeIndexerMetrics,
-        config: Config,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+        config: IndexerConfig,
+    ) -> Result<Self, anyhow::Error> {
         let bridge_address = EthAddress::from_str(&config.eth_sui_bridge_contract_address)?;
 
         let provider = Arc::new(
@@ -47,6 +52,7 @@ impl EthBridgeWorker {
         Ok(Self {
             provider,
             pg_pool,
+            bridge_metrics,
             metrics,
             bridge_address,
             config,
@@ -69,9 +75,9 @@ impl EthBridgeWorker {
 
         let (_task_handles, eth_events_rx, _) =
             EthSyncer::new(eth_client, finalized_contract_addresses)
-                .run()
+                .run(self.bridge_metrics.clone())
                 .await
-                .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))?;
+                .map_err(|e| anyhow!(format!("{e:?}")))?;
 
         let provider_clone = self.provider.clone();
         let pg_pool_clone = self.pg_pool.clone();
@@ -114,9 +120,9 @@ impl EthBridgeWorker {
             self.provider.clone(),
             unfinalized_contract_addresses.clone(),
         )
-        .run()
+        .run(self.metrics.clone())
         .await
-        .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))?;
+        .map_err(|e| anyhow!(format!("{e:?}")))?;
 
         let provider_clone = self.provider.clone();
         let pg_pool_clone = self.pg_pool.clone();
@@ -139,31 +145,34 @@ impl EthBridgeWorker {
     }
 }
 
-async fn process_eth_events(
+async fn process_eth_events<E: EthEvent>(
     provider: Arc<Provider<Http>>,
     pg_pool: PgPool,
     metrics: BridgeIndexerMetrics,
-    mut eth_events_rx: mysten_metrics::metered_channel::Receiver<(EthAddress, u64, Vec<EthLog>)>,
+    mut eth_events_rx: mysten_metrics::metered_channel::Receiver<(EthAddress, u64, Vec<E>)>,
     finalized: bool,
 ) {
+    let progress_gauge = if finalized {
+        metrics.last_committed_eth_block.clone()
+    } else {
+        metrics.last_committed_unfinalized_eth_block.clone()
+    };
     while let Some((_, _, logs)) = eth_events_rx.recv().await {
+        // TODO: This for-loop can be optimzied to group tx / block info
+        // and reduce the queries issued to eth full node
         for log in logs.iter() {
-            let eth_bridge_event = EthBridgeEvent::try_from_eth_log(log);
+            let eth_bridge_event = EthBridgeEvent::try_from_log(log.log());
             if eth_bridge_event.is_none() {
                 continue;
             }
             metrics.total_eth_bridge_transactions.inc();
             let bridge_event = eth_bridge_event.unwrap();
-            let block_number = log.block_number;
-            let block = provider.get_block(log.block_number).await.unwrap().unwrap();
+            let block_number = log.block_number();
+            let block = provider.get_block(block_number).await.unwrap().unwrap();
             let timestamp = block.timestamp.as_u64() * 1000;
-            let transaction = provider
-                .get_transaction(log.tx_hash)
-                .await
-                .unwrap()
-                .unwrap();
+            let tx_hash = log.tx_hash();
+            let transaction = provider.get_transaction(tx_hash).await.unwrap().unwrap();
             let gas = transaction.gas;
-            let tx_hash = log.tx_hash;
 
             let transfer: TokenTransfer = match bridge_event {
                 EthBridgeEvent::EthSuiBridgeEvents(bridge_event) => match bridge_event {
@@ -240,8 +249,11 @@ async fn process_eth_events(
                 }
             };
 
-            if let Err(e) = write(&pg_pool, vec![transfer]) {
+            // TODO: we either scream here or keep retrying this until we succeed
+            if let Err(e) = write(&pg_pool, vec![ProcessedTxnData::TokenTransfer(transfer)]) {
                 error!("Error writing token transfer to database: {:?}", e);
+            } else {
+                progress_gauge.set(block_number as i64);
             }
         }
     }

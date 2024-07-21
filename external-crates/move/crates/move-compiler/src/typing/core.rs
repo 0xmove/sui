@@ -24,12 +24,14 @@ use crate::{
         known_attributes::TestingAttribute,
         matching::{new_match_var_name, MatchContext},
         program_info::*,
-        string_utils::debug_print,
+        string_utils::{debug_print, format_oxford_list},
         unique_map::UniqueMap,
         *,
     },
+    typing::deprecation_warnings::Deprecations,
     FullyCompiledProgram,
 };
+use known_attributes::AttributePosition;
 use move_ir_types::location::*;
 use move_symbol_pool::Symbol;
 use std::{
@@ -91,6 +93,8 @@ pub struct Context<'env> {
     macros: UniqueMap<ModuleIdent, UniqueMap<FunctionName, N::Sequence>>,
     pub env: &'env mut CompilationEnv,
     pub(super) debug: TypingDebugFlags,
+
+    deprecations: Deprecations,
 
     // for generating new variables during match compilation
     next_match_var_id: usize,
@@ -180,6 +184,7 @@ impl<'env> Context<'env> {
         info: NamingProgramInfo,
     ) -> Self {
         let global_use_funs = UseFunsScope::global(&info);
+        let deprecations = Deprecations::new(env, &info);
         let debug = TypingDebugFlags {
             match_counterexample: false,
             autocomplete_resolution: false,
@@ -208,6 +213,7 @@ impl<'env> Context<'env> {
             macro_expansion: vec![],
             lambda_expansion: vec![],
             ide_info: IDEInfo::new(),
+            deprecations,
         }
     }
 
@@ -471,6 +477,19 @@ impl<'env> Context<'env> {
         }
     }
 
+    pub fn expanding_macros_names(&self) -> Option<String> {
+        if self.macro_expansion.is_empty() {
+            return None;
+        }
+        let names = self
+            .macro_expansion
+            .iter()
+            .filter_map(|exp| exp.maybe_name())
+            .map(|(m, f)| format!("{m}::{f}"))
+            .collect::<Vec<_>>();
+        Some(format_oxford_list!("and", "'{}'", names))
+    }
+
     pub fn current_call_color(&self) -> Color {
         self.use_funs.last().unwrap().color.unwrap()
     }
@@ -623,6 +642,25 @@ impl<'env> Context<'env> {
                     finfo.attributes.is_test_or_test_only()
                 })
         })
+    }
+
+    pub fn emit_warning_if_deprecated(
+        &mut self,
+        mident: &ModuleIdent,
+        name: Name,
+        method_opt: Option<Name>,
+    ) {
+        let in_same_module = self
+            .current_module
+            .is_some_and(|current| current == *mident);
+        if let Some(deprecation) = self.deprecations.get_deprecation(*mident, name) {
+            // Don't register a warning if we are in the module that is deprecated and the actual
+            // member is not deprecated.
+            if deprecation.location == AttributePosition::Module && in_same_module {
+                return;
+            }
+            deprecation.emit_deprecation_warning(self.env, name, method_opt);
+        }
     }
 
     fn module_info(&self, m: &ModuleIdent) -> &ModuleInfo {
@@ -837,6 +875,15 @@ impl MatchContext<false> for Context<'_> {
 
     fn program_info(&self) -> &ProgramInfo<false> {
         &self.modules
+    }
+}
+
+impl MacroExpansion {
+    fn maybe_name(&self) -> Option<(ModuleIdent, FunctionName)> {
+        match self {
+            MacroExpansion::Call(call) => Some((call.module, call.function)),
+            MacroExpansion::Argument { .. } => None,
+        }
     }
 }
 
@@ -1108,6 +1155,7 @@ pub fn make_struct_type(
     n: &DatatypeName,
     ty_args_opt: Option<Vec<Type>>,
 ) -> (Type, Vec<Type>) {
+    context.emit_warning_if_deprecated(m, n.0, None);
     let tn = sp(loc, TypeName_::ModuleType(*m, *n));
     let sdef = context.struct_definition(m, n);
     match ty_args_opt {
@@ -1244,6 +1292,7 @@ pub fn make_enum_type(
     enum_: &DatatypeName,
     ty_args_opt: Option<Vec<Type>>,
 ) -> (Type, Vec<Type>) {
+    context.emit_warning_if_deprecated(mident, enum_.0, None);
     let tn = sp(loc, TypeName_::ModuleType(*mident, *enum_));
     let edef = context.enum_definition(mident, enum_);
     match ty_args_opt {
@@ -1302,6 +1351,7 @@ pub fn make_constant_type(
     c: &ConstantName,
 ) -> Type {
     let in_current_module = Some(m) == context.current_module.as_ref();
+    context.emit_warning_if_deprecated(m, c.0, None);
     let (defined_loc, signature) = {
         let ConstantInfo {
             attributes: _,
@@ -1410,7 +1460,15 @@ pub fn make_method_call_type(
         return None;
     };
 
-    let function_ty = make_function_type(context, loc, &target_m, &target_f, ty_args_opt);
+    let target_f = target_f.with_loc(method.loc);
+    let function_ty = make_function_type(
+        context,
+        loc,
+        &target_m,
+        &target_f,
+        ty_args_opt,
+        Some(method),
+    );
 
     Some((target_m, target_f, function_ty))
 }
@@ -1423,7 +1481,9 @@ pub fn make_function_type(
     m: &ModuleIdent,
     f: &FunctionName,
     ty_args_opt: Option<Vec<Type>>,
+    method_opt: Option<Name>,
 ) -> ResolvedFunctionType {
+    context.emit_warning_if_deprecated(m, f.0, method_opt);
     let return_ty = make_function_type_no_visibility_check(context, loc, m, f, ty_args_opt);
     let finfo = context.function_info(m, f);
     let defined_loc = finfo.defined_loc;
@@ -1538,7 +1598,7 @@ fn check_function_visibility(
                 Visibility::PUBLIC,
                 friend_or_package,
             );
-            report_visibility_error(
+            report_visibility_error_(
                 context,
                 public_for_testing,
                 (
@@ -1580,7 +1640,7 @@ fn check_function_visibility(
                     .map(|pkg_name| format!("{}", pkg_name))
                     .unwrap_or("<unknown package>".to_string())
             );
-            report_visibility_error(
+            report_visibility_error_(
                 context,
                 public_for_testing,
                 (usage_loc, msg),
@@ -1595,7 +1655,7 @@ fn check_function_visibility(
             );
             let internal_msg =
                 format!("This function can only be called from a 'friend' of module '{m}'",);
-            report_visibility_error(
+            report_visibility_error_(
                 context,
                 public_for_testing,
                 (usage_loc, msg),
@@ -1632,7 +1692,15 @@ pub fn public_testing_visibility(
     callee_entry.map(PublicForTesting::Entry)
 }
 
-fn report_visibility_error(
+pub fn report_visibility_error(
+    context: &mut Context,
+    call_msg: (Loc, impl ToString),
+    defn_msg: (Loc, impl ToString),
+) {
+    report_visibility_error_(context, None, call_msg, defn_msg)
+}
+
+fn report_visibility_error_(
     context: &mut Context,
     public_for_testing: Option<PublicForTesting>,
     (call_loc, call_msg): (Loc, impl ToString),
@@ -1659,6 +1727,30 @@ fn report_visibility_error(
             };
             diag.add_secondary_label((test_loc, test_msg))
         }
+    }
+    if let Some(names) = context.expanding_macros_names() {
+        let macro_s = if context.macro_expansion.len() > 1 {
+            "macros"
+        } else {
+            "macro"
+        };
+        match context.macro_expansion.first() {
+            Some(MacroExpansion::Call(call)) => {
+                diag.add_secondary_label((call.invocation, "While expanding this macro"));
+            }
+            _ => {
+                context.env.add_diag(ice!((
+                    call_loc,
+                    "Error when dealing with macro visibilities"
+                )));
+            }
+        };
+        diag.add_note(format!(
+            "This visibility error occurs in a macro body while expanding the {macro_s} {names}"
+        ));
+        diag.add_note(
+            "Visibility inside of expanded macros is resolved in the scope of the caller.",
+        );
     }
     context.env.add_diag(diag);
 }
@@ -2178,6 +2270,7 @@ fn instantiate_apply_impl(
             (0..*len).map(|_| AbilitySet::empty()).collect()
         }
         sp!(_, N::TypeName_::ModuleType(m, n)) => {
+            context.emit_warning_if_deprecated(m, n.0, None);
             debug_assert!(abilities_opt.is_none(), "ICE instantiated expanded type");
             let tps = match context.datatype_kind(m, n) {
                 DatatypeKind::Struct => context.struct_tparams(m, n),

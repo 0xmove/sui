@@ -41,17 +41,32 @@ pub trait EpochStartConfigTrait {
     }
 }
 
+// IMPORTANT: Assign explicit values to each variant to ensure that the values are stable.
+// When cherry-picking changes from one branch to another, the value of variants must never
+// change.
+//
+// Unlikely: If you cherry pick a change from one branch to another, and there is a collision
+// in the value of some variant, the branch which has been released should take precedence.
+// In this case, the picked-from branch is inconsistent with the released branch, and must
+// be fixed.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum EpochFlag {
     // The deprecated flags have all been in production for long enough that
     // we can have deleted the old code paths they were guarding.
     // We retain them here in order not to break deserialization.
-    _InMemoryCheckpointRootsDeprecated,
-    _PerEpochFinalizedTransactionsDeprecated,
-    _ObjectLockSplitTablesDeprecated,
+    _InMemoryCheckpointRootsDeprecated = 0,
+    _PerEpochFinalizedTransactionsDeprecated = 1,
+    _ObjectLockSplitTablesDeprecated = 2,
 
-    WritebackCacheEnabled,
-    StateAccumulatorV2Enabled,
+    WritebackCacheEnabled = 3,
+
+    // This flag was "burned" because it was deployed with a broken version of the code. The
+    // new flags below are required to enable state accumulator v2
+    _StateAccumulatorV2EnabledDeprecated = 4,
+    StateAccumulatorV2EnabledTestnet = 5,
+    StateAccumulatorV2EnabledMainnet = 6,
+
+    ExecutedInEpochTable = 7,
 }
 
 impl EpochFlag {
@@ -61,14 +76,14 @@ impl EpochFlag {
 
     /// For situations in which there is no config available (e.g. setting up a downloaded snapshot).
     pub fn default_for_no_config() -> Vec<Self> {
-        Self::default_flags_impl(&Default::default(), false)
+        Self::default_flags_impl(&Default::default(), true)
     }
 
     fn default_flags_impl(
         cache_config: &ExecutionCacheConfig,
         enable_state_accumulator_v2: bool,
     ) -> Vec<Self> {
-        let mut new_flags = vec![];
+        let mut new_flags = vec![EpochFlag::ExecutedInEpochTable];
 
         if matches!(
             choose_execution_cache(cache_config),
@@ -78,7 +93,8 @@ impl EpochFlag {
         }
 
         if enable_state_accumulator_v2 {
-            new_flags.push(EpochFlag::StateAccumulatorV2Enabled);
+            new_flags.push(EpochFlag::StateAccumulatorV2EnabledTestnet);
+            new_flags.push(EpochFlag::StateAccumulatorV2EnabledMainnet);
         }
 
         new_flags
@@ -99,7 +115,16 @@ impl fmt::Display for EpochFlag {
                 write!(f, "ObjectLockSplitTables (DEPRECATED)")
             }
             EpochFlag::WritebackCacheEnabled => write!(f, "WritebackCacheEnabled"),
-            EpochFlag::StateAccumulatorV2Enabled => write!(f, "StateAccumulatorV2Enabled"),
+            EpochFlag::_StateAccumulatorV2EnabledDeprecated => {
+                write!(f, "StateAccumulatorV2EnabledDeprecated (DEPRECATED)")
+            }
+            EpochFlag::ExecutedInEpochTable => write!(f, "ExecutedInEpochTable"),
+            EpochFlag::StateAccumulatorV2EnabledTestnet => {
+                write!(f, "StateAccumulatorV2EnabledTestnet")
+            }
+            EpochFlag::StateAccumulatorV2EnabledMainnet => {
+                write!(f, "StateAccumulatorV2EnabledMainnet")
+            }
         }
     }
 }

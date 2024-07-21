@@ -41,6 +41,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::time::Duration;
 use sui_protocol_config::ProtocolVersion;
 use sui_types::base_types::{AuthorityName, EpochId, TransactionDigest};
@@ -859,7 +860,7 @@ pub struct CheckpointBuilder {
     notify: Arc<Notify>,
     notify_aggregator: Arc<Notify>,
     effects_store: Arc<dyn TransactionCacheRead>,
-    accumulator: Arc<StateAccumulator>,
+    accumulator: Weak<StateAccumulator>,
     output: Box<dyn CheckpointOutput>,
     exit: watch::Receiver<()>,
     metrics: Arc<CheckpointMetrics>,
@@ -897,7 +898,7 @@ impl CheckpointBuilder {
         epoch_store: Arc<AuthorityPerEpochStore>,
         notify: Arc<Notify>,
         effects_store: Arc<dyn TransactionCacheRead>,
-        accumulator: Arc<StateAccumulator>,
+        accumulator: Weak<StateAccumulator>,
         output: Box<dyn CheckpointOutput>,
         exit: watch::Receiver<()>,
         notify_aggregator: Arc<Notify>,
@@ -1168,6 +1169,7 @@ impl CheckpointBuilder {
         let mut batch = self.tables.checkpoint_content.batch();
         let mut all_tx_digests =
             Vec::with_capacity(new_checkpoints.iter().map(|(_, c)| c.size()).sum());
+
         for (summary, contents) in &new_checkpoints {
             debug!(
                 checkpoint_commit_height = height,
@@ -1176,8 +1178,9 @@ impl CheckpointBuilder {
                 "writing checkpoint",
             );
             all_tx_digests.extend(contents.iter().map(|digests| digests.transaction));
+
             self.output
-                .checkpoint_created(summary, contents, &self.epoch_store)
+                .checkpoint_created(summary, contents, &self.epoch_store, &self.tables)
                 .await?;
 
             self.metrics
@@ -1429,22 +1432,30 @@ impl CheckpointBuilder {
                     )
                     .await?;
 
-                let committee = system_state_obj.get_current_epoch_committee().committee;
+                let committee = system_state_obj
+                    .get_current_epoch_committee()
+                    .committee()
+                    .clone();
 
                 // This must happen after the call to augment_epoch_last_checkpoint,
-                // otherwise we will not capture the change_epoch tx
-                let acc = self.accumulator.accumulate_checkpoint(
-                    effects.clone(),
-                    sequence_number,
-                    &self.epoch_store,
-                )?;
-                self.accumulator
-                    .accumulate_running_root(&self.epoch_store, sequence_number, Some(acc))
-                    .await?;
-                let root_state_digest = self
-                    .accumulator
-                    .digest_epoch(self.epoch_store.clone(), sequence_number)
-                    .await?;
+                // otherwise we will not capture the change_epoch tx.
+                let root_state_digest = {
+                    let state_acc = self
+                        .accumulator
+                        .upgrade()
+                        .expect("No checkpoints should be getting built after local configuration");
+                    let acc = state_acc.accumulate_checkpoint(
+                        effects.clone(),
+                        sequence_number,
+                        &self.epoch_store,
+                    )?;
+                    state_acc
+                        .accumulate_running_root(&self.epoch_store, sequence_number, Some(acc))
+                        .await?;
+                    state_acc
+                        .digest_epoch(self.epoch_store.clone(), sequence_number)
+                        .await?
+                };
                 self.metrics.highest_accumulated_epoch.set(epoch as i64);
                 info!("Epoch {epoch} root state hash digest: {root_state_digest:?}");
 
@@ -1606,7 +1617,7 @@ impl CheckpointBuilder {
 
                 let existing_effects = self
                     .epoch_store
-                    .effects_signatures_exists(effect.dependencies().iter())?;
+                    .transactions_executed_in_cur_epoch(effect.dependencies().iter())?;
 
                 for (dependency, effects_signature_exists) in
                     effect.dependencies().iter().zip(existing_effects.iter())
@@ -2047,8 +2058,7 @@ async fn diagnose_split_brain(
         .get_sui_committee_with_network_metadata();
     let network_config = default_mysten_network_config();
     let network_clients =
-        make_network_authority_clients_with_network_config(&committee, &network_config)
-            .expect("Failed to make authority clients from committee {committee}");
+        make_network_authority_clients_with_network_config(&committee, &network_config);
 
     // Query all disagreeing validators
     let response_futures = digest_to_validator
@@ -2213,7 +2223,7 @@ impl CheckpointService {
         checkpoint_store: Arc<CheckpointStore>,
         epoch_store: Arc<AuthorityPerEpochStore>,
         effects_store: Arc<dyn TransactionCacheRead>,
-        accumulator: Arc<StateAccumulator>,
+        accumulator: Weak<StateAccumulator>,
         checkpoint_output: Box<dyn CheckpointOutput>,
         certified_checkpoint_output: Box<dyn CertifiedCheckpointOutput>,
         metrics: Arc<CheckpointMetrics>,
@@ -2294,19 +2304,20 @@ impl CheckpointServiceNotify for CheckpointService {
     ) -> SuiResult {
         let sequence = info.summary.sequence_number;
         let signer = info.summary.auth_sig().authority.concise();
-        if let Some(last_certified) = self
+
+        if let Some(highest_verified_checkpoint) = self
             .tables
-            .certified_checkpoints
-            .keys()
-            .skip_to_last()
-            .next()
-            .transpose()?
+            .get_highest_verified_checkpoint()?
+            .map(|x| *x.sequence_number())
         {
-            if sequence <= last_certified {
+            if sequence <= highest_verified_checkpoint {
                 debug!(
                     checkpoint_seq = sequence,
                     "Ignore checkpoint signature from {} - already certified", signer,
                 );
+                self.metrics
+                    .last_ignored_checkpoint_signature_received
+                    .set(sequence as i64);
                 return Ok(());
             }
         }
@@ -2503,15 +2514,17 @@ mod tests {
         let checkpoint_store = CheckpointStore::new(ckpt_dir.path());
         let epoch_store = state.epoch_store_for_testing();
 
-        let accumulator =
-            StateAccumulator::new(state.get_accumulator_store().clone(), &epoch_store);
+        let accumulator = Arc::new(StateAccumulator::new_for_tests(
+            state.get_accumulator_store().clone(),
+            &epoch_store,
+        ));
 
         let (checkpoint_service, _exit) = CheckpointService::spawn(
             state.clone(),
             checkpoint_store,
             epoch_store.clone(),
             store,
-            Arc::new(accumulator),
+            Arc::downgrade(&accumulator),
             Box::new(output),
             Box::new(certified_output),
             CheckpointMetrics::new_for_tests(),
@@ -2694,6 +2707,7 @@ mod tests {
             summary: &CheckpointSummary,
             contents: &CheckpointContents,
             _epoch_store: &Arc<AuthorityPerEpochStore>,
+            _checkpoint_store: &Arc<CheckpointStore>,
         ) -> SuiResult {
             self.try_send((contents.clone(), summary.clone())).unwrap();
             Ok(())
@@ -2754,10 +2768,10 @@ mod tests {
         let effects = e(digest, dependencies, gas_used);
         store.insert(digest, effects.clone());
         epoch_store
-            .insert_tx_cert_and_effects_signature(
+            .insert_tx_key_and_effects_signature(
                 &TransactionKey::Digest(digest),
                 &digest,
-                None,
+                &effects.digest(),
                 Some(&AuthoritySignInfo::new(
                     epoch_store.epoch(),
                     &effects,
